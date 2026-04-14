@@ -5,7 +5,34 @@ import functions_framework
 import stripe
 from google.cloud import secretmanager
 from google.cloud import bigquery
+import os
+import functions_framework
+from google.cloud import secretmanager
+from google.cloud import bigquery
+import stripe
 
+@functions_framework.http
+def fetch_stripe_charges(request):
+    # This minimal version helps us confirm if the clients can even load
+    try:
+        project_id = os.environ.get("GCP_PROJECT") or "project-babb1b90-331a-4e2e-a1b"
+        
+        print(f"Starting check for Project: {project_id}")
+        
+        # Test Secret Manager Client
+        sm_client = secretmanager.SecretManagerServiceClient()
+        print("Secret Manager Client initialized.")
+        
+        # Test BigQuery Client
+        bq_client = bigquery.Client(project=project_id)
+        print("BigQuery Client initialized.")
+        
+        # If we got here, the "Port 8080" error should be gone.
+        return "Infrastructure Check Passed. You can now add your Stripe logic back.", 200
+
+    except Exception as e:
+        print(f"DEBUG ERROR: {str(e)}")
+        return f"Caught Error: {str(e)}", 500
 # We define the schema here as a static object. 
 # This is safe to keep global as it doesn't require API calls.
 TABLE_SCHEMA = [
