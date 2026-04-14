@@ -1,1 +1,16 @@
---runtime=python311
+```yaml
+steps:
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    args:
+      - 'gcloud'
+      - 'functions'
+      - 'deploy'
+      - 'stripe-fetch-charges'
+      - '--gen2'
+      - '--runtime=python311'  # <--- CRITICAL FIX
+      - '--region=australia-southeast1'
+      - '--source=.'
+      - '--entry-point=fetch_stripe_charges'
+      - '--trigger-http'
+      - '--set-env-vars'
+      - 'GCP_PROJECT=$PROJECT_ID'
