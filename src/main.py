@@ -5,42 +5,42 @@ import functions_framework
 @functions_framework.http
 def fetch_stripe_charges(request):
     """
-    Stripe to BigQuery Ingestion Service.
-    Delayed imports are used to ensure the container starts in <1 second.
+    Final Engineered Solution: Stripe to BigQuery.
+    Bypasses Port 8080 timeout by delaying all heavy library loads.
     """
-    print("Function triggered. Container is active on Port 8080.")
+    print("Container Check-in: Listening on Port 8080. Logic starting...")
 
     try:
-        # Delayed Imports
+        # 1. Delayed Library Loading (Crucial for Cold Start success)
         import uuid
         import datetime
         import stripe
         from google.cloud import secretmanager
         from google.cloud import bigquery
-
-        # Configuration
+        
+        # 2. Project Context
+        # Fallback to hardcoded ID to prevent env-var related startup crashes
         project_id = os.environ.get("GCP_PROJECT") or "project-babb1b90-331a-4e2e-a1b"
-        dataset_id = "stripe_dataset"
-        table_name = "stripe_charges"
-
-        # Initialize Clients
+        
+        # 3. Client Initialization
         sm_client = secretmanager.SecretManagerServiceClient()
         bq_client = bigquery.Client(project=project_id)
 
-        # 1. Retrieve API Key
+        # 4. API Key Access
         secret_name = f"projects/{project_id}/secrets/STRIPE_API_KEY/versions/latest"
-        response = sm_client.access_secret_version(request={"name": secret_name})
-        stripe.api_key = response.payload.data.decode("UTF-8")
+        secret_version = sm_client.access_secret_version(request={"name": secret_name})
+        stripe.api_key = secret_version.payload.data.decode("UTF-8")
 
-        # 2. Fetch last 24 hours of Charges
+        # 5. Incremental Data Fetch
         now = datetime.datetime.now(datetime.UTC)
-        start_ts = int((now - datetime.timedelta(hours=24)).timestamp())
+        start_time = int((now - datetime.timedelta(hours=24)).timestamp())
         
         charges_data = []
         batch_id = str(uuid.uuid4())
         
-        # Stripe Auto-pagination
-        charges = stripe.Charge.list(created={"gte": start_ts}, limit=100)
+        print(f"Fetching Stripe charges since Unix: {start_time}")
+        charges = stripe.Charge.list(created={"gte": start_time}, limit=100)
+
         for charge in charges.auto_paging_iter():
             charge_dict = charge.to_dict_recursive()
             charges_data.append({
@@ -55,13 +55,14 @@ def fetch_stripe_charges(request):
             })
 
         if not charges_data:
-            return "Sync success: No new charges found.", 200
+            return "Sync Success: No new records to process.", 200
 
-        # 3. BigQuery Upsert (Merge Strategy)
-        master_table = f"{project_id}.{dataset_id}.{table_name}"
-        staging_table = f"{project_id}.{dataset_id}.{table_name}_staging"
+        # 6. BigQuery Upsert (Staging-to-Master Merge)
+        dataset_id = "stripe_dataset"
+        master_table = f"{project_id}.{dataset_id}.stripe_charges"
+        staging_table = f"{project_id}.{dataset_id}.stripe_charges_staging"
 
-        SCHEMA = [
+        schema = [
             bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
             bigquery.SchemaField("stripe_created", "INTEGER"),
             bigquery.SchemaField("data", "JSON"),
@@ -72,12 +73,12 @@ def fetch_stripe_charges(request):
             ]),
         ]
 
-        # Overwrite staging
-        load_config = bigquery.LoadJobConfig(schema=SCHEMA, write_disposition="WRITE_TRUNCATE")
+        # Load to staging table
+        job_config = bigquery.LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE")
         bq_client.load_table_from_json(charges_data, staging_table, job_config=load_config).result()
 
-        # Merge staging to master
-        merge_sql = f"""
+        # Merge to master table (Handles snapshots/deduplication)
+        merge_query = f"""
         MERGE `{master_table}` T
         USING `{staging_table}` S
         ON T.id = S.id
@@ -85,10 +86,10 @@ def fetch_stripe_charges(request):
         WHEN NOT MATCHED THEN INSERT (id, stripe_created, data, ingestion_metadata)
         VALUES (id, stripe_created, data, ingestion_metadata)
         """
-        bq_client.query(merge_sql).result()
+        bq_client.query(merge_query).result()
 
-        return f"Successfully processed {len(charges_data)} records.", 200
+        return f"Successfully synced {len(charges_data)} records.", 200
 
     except Exception as e:
-        print(f"ERROR: {str(e)}")
-        return f"Pipeline Error: {str(e)}", 500
+        print(f"PIPELINE FAILURE: {str(e)}")
+        return f"Internal Error: {str(e)}", 500
