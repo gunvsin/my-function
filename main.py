@@ -1,4 +1,4 @@
-```python
+``python
 import os
 import uuid
 import datetime
@@ -7,15 +7,27 @@ import stripe
 from google.cloud import secretmanager
 from google.cloud import bigquery
 
-# Config
+# Configuration
 PROJECT_ID = os.environ.get("GCP_PROJECT")
 SECRET_ID = "STRIPE_API_KEY"
-# We recommend a dedicated table for Charges for better query performance
 DATASET_ID = "stripe_dataset"
 TABLE_ID = "stripe_charges"
 STAGING_TABLE_ID = f"{TABLE_ID}_staging"
 
+# Define the BigQuery Schema explicitly to avoid "RECORD has no schema" errors
+SCHEMA = [
+    bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("stripe_created", "INTEGER", mode="NULLABLE"),
+    bigquery.SchemaField("data", "JSON", mode="NULLABLE"),
+    bigquery.SchemaField("ingestion_metadata", "RECORD", mode="NULLABLE", fields=[
+        bigquery.SchemaField("source_name", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("processing_timestamp", "TIMESTAMP", mode="NULLABLE"),
+        bigquery.SchemaField("batch_uuid", "STRING", mode="NULLABLE"),
+    ]),
+]
+
 def get_stripe_api_key():
+    """Fetches the secret from Google Cloud Secret Manager."""
     client = secretmanager.SecretManagerServiceClient()
     name = f"projects/{PROJECT_ID}/secrets/{SECRET_ID}/versions/latest"
     response = client.access_secret_version(request={"name": name})
@@ -23,51 +35,62 @@ def get_stripe_api_key():
 
 @functions_framework.http
 def fetch_stripe_charges(request):
+    """HTTP Cloud Function to fetch Stripe charges and upsert into BigQuery."""
     try:
+        # 1. Setup Clients
         stripe.api_key = get_stripe_api_key()
         bq_client = bigquery.Client()
 
-        # 1. Fetch data from Stripe
+        # 2. Fetch Charges from last 24 hours
         now = datetime.datetime.now(datetime.UTC)
-        twenty_four_hours_ago = int((now - datetime.timedelta(hours=24)).timestamp())
+        start_timestamp = int((now - datetime.timedelta(hours=24)).timestamp())
         
         charges_list = []
-        charges = stripe.Charge.list(created={"gte": twenty_four_hours_ago}, limit=100)
+        # auto_paging_iter handles Stripe's pagination automatically
+        charges = stripe.Charge.list(created={"gte": start_timestamp}, limit=100)
+
+        batch_uuid = str(uuid.uuid4())
 
         for charge in charges.auto_paging_iter():
             charge_dict = charge.to_dict_recursive()
             
-            # Prepare row for BigQuery
             row = {
-                "id": charge_dict['id'], # Stripe Charge ID (e.g., ch_123)
-                "stripe_created": charge_dict['created'], # Unix timestamp
-                "data": charge_dict, # The full snapshot as JSON
+                "id": charge_dict['id'],
+                "stripe_created": charge_dict['created'],
+                "data": charge_dict, # This goes into the JSON column
                 "ingestion_metadata": {
                     "source_name": "Stripe_Primary",
                     "processing_timestamp": now.isoformat(),
-                    "batch_uuid": str(uuid.uuid4())
+                    "batch_uuid": batch_uuid
                 }
             }
             charges_list.append(row)
 
         if not charges_list:
-            return "No charges found.", 200
+            return "No charges found in the last 24 hours.", 200
 
-        # 2. Define Table Paths
-        full_table_path = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+        # 3. Define Table References
+        master_table_path = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
         staging_table_path = f"{PROJECT_ID}.{DATASET_ID}.{STAGING_TABLE_ID}"
 
-        # 3. Load to Staging Table (Overwrite staging each time)
+        # 4. Load Data to Staging Table
+        # WRITE_TRUNCATE ensures the staging table is cleaned every time we run
         job_config = bigquery.LoadJobConfig(
+            schema=SCHEMA,
             write_disposition="WRITE_TRUNCATE",
         )
-        load_job = bq_client.load_table_from_json(charges_list, staging_table_path, job_config=job_config)
-        load_job.result() 
+        
+        load_job = bq_client.load_table_from_json(
+            charges_list, 
+            staging_table_path, 
+            job_config=job_config
+        )
+        load_job.result() # Wait for upload to finish
 
-        # 4. Perform MERGE Statement (Deduplication Logic)
-        # This updates the record if the ID exists, or inserts if it's new.
+        # 5. MERGE Staging into Master (Deduplication Logic)
+        # This updates the row if the ID exists, or inserts it if it's new
         merge_query = f"""
-        MERGE `{full_table_path}` T
+        MERGE `{master_table_path}` T
         USING `{staging_table_path}` S
         ON T.id = S.id
         WHEN MATCHED THEN
@@ -83,9 +106,11 @@ def fetch_stripe_charges(request):
         query_job = bq_client.query(merge_query)
         query_job.result()
 
-        return f"Successfully processed {len(charges_list)} charges with MERGE.", 200
+        return f"Processed {len(charges_list)} charges successfully.", 200
 
     except Exception as e:
-        print(f"Error: {str(e)}")
-        return f"Error: {str(e)}", 500
+        print(f"Error encountered: {str(e)}")
+        return f"Internal Error: {str(e)}", 500
 ```
+
+---
