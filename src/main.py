@@ -6,29 +6,34 @@ import stripe
 from google.cloud import secretmanager
 from google.cloud import bigquery
 
-# DO NOT fetch secrets here at the top level.
-# Only define constants.
-DATASET_ID = "stripe_dataset"
-TABLE_ID = "stripe_charges"
+# We define the schema here so BigQuery knows the structure
+SCHEMA = [
+    bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("stripe_created", "INTEGER", mode="NULLABLE"),
+    bigquery.SchemaField("data", "JSON", mode="NULLABLE"),
+    bigquery.SchemaField("ingestion_metadata", "RECORD", mode="NULLABLE", fields=[
+        bigquery.SchemaField("source_name", "STRING"),
+        bigquery.SchemaField("processing_timestamp", "TIMESTAMP"),
+        bigquery.SchemaField("batch_uuid", "STRING"),
+    ]),
+]
 
 @functions_framework.http
 def fetch_stripe_charges(request):
-    """Entry point: logic is now fully encapsulated to prevent startup crashes."""
     try:
-        # 1. Fetch Project ID
-        # In Cloud Functions, this is often provided as 'GOOGLE_CLOUD_PROJECT'
-        project_id = os.environ.get("GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        # 1. Get Project ID from environment
+        project_id = os.environ.get("GCP_PROJECT") or "project-babb1b90-331a-4e2e-a1b"
         
-        # 2. Initialize Clients inside the handler
+        # 2. Initialize Clients INSIDE the function to prevent startup crashes
         sm_client = secretmanager.SecretManagerServiceClient()
         bq_client = bigquery.Client(project=project_id)
 
-        # 3. Fetch Secret
-        secret_name = f"projects/{project_id}/secrets/STRIPE_API_KEY/versions/latest"
-        response = sm_client.access_secret_version(request={"name": secret_name})
+        # 3. Access Secret
+        secret_path = f"projects/{project_id}/secrets/STRIPE_API_KEY/versions/latest"
+        response = sm_client.access_secret_version(request={"name": secret_path})
         stripe.api_key = response.payload.data.decode("UTF-8")
 
-        # 4. Stripe Logic
+        # 4. Fetch Stripe Data
         now = datetime.datetime.now(datetime.UTC)
         start_time = int((now - datetime.timedelta(hours=24)).timestamp())
         
@@ -49,40 +54,47 @@ def fetch_stripe_charges(request):
             })
 
         if not charges_list:
-            return "No charges found.", 200
+            return "No new charges found.", 200
 
-        # 5. BigQuery Operations
-        master_table = f"{project_id}.{DATASET_ID}.{TABLE_ID}"
-        staging_table = f"{project_id}.{DATASET_ID}.{TABLE_ID}_staging"
+        # 5. Table Configuration
+        dataset_id = "stripe_dataset"
+        table_id = "stripe_charges"
+        full_table_path = f"{project_id}.{dataset_id}.{table_id}"
+        staging_table_path = f"{project_id}.{dataset_id}.{table_id}_staging"
 
-        # Explicit Schema (Prevents "RECORD has no schema" error)
-        SCHEMA = [
-            bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("stripe_created", "INTEGER", mode="NULLABLE"),
-            bigquery.SchemaField("data", "JSON", mode="NULLABLE"),
-            bigquery.SchemaField("ingestion_metadata", "RECORD", mode="NULLABLE", fields=[
-                bigquery.SchemaField("source_name", "STRING"),
-                bigquery.SchemaField("processing_timestamp", "TIMESTAMP"),
-                bigquery.SchemaField("batch_uuid", "STRING"),
-            ]),
-        ]
-
-        job_config = bigquery.LoadJobConfig(schema=SCHEMA, write_disposition="WRITE_TRUNCATE")
-        load_job = bq_client.load_table_from_json(charges_list, staging_table, job_config=job_config)
+        # 6. Load to Staging (This auto-creates the table if it doesn't exist)
+        job_config = bigquery.LoadJobConfig(
+            schema=SCHEMA,
+            write_disposition="WRITE_TRUNCATE",
+        )
+        
+        load_job = bq_client.load_table_from_json(charges_list, staging_table_path, job_config=job_config)
         load_job.result()
 
-        merge_sql = f"""
-        MERGE `{master_table}` T
-        USING `{staging_table}` S
-        ON T.id = S.id
-        WHEN MATCHED THEN UPDATE SET T.data = S.data, T.ingestion_metadata = S.ingestion_metadata
-        WHEN NOT MATCHED THEN INSERT ROW
-        """
-        bq_client.query(merge_sql).result()
+        # 7. Ensure Master Table exists (Merge fails if Master is missing)
+        try:
+            bq_client.get_table(full_table_path)
+        except:
+            # Create master table with same schema if missing
+            table = bigquery.Table(full_table_path, schema=SCHEMA)
+            bq_client.create_table(table)
 
-        return f"Successfully synced {len(charges_list)} charges.", 200
+        # 8. MERGE Logic
+        merge_query = f"""
+        MERGE `{full_table_path}` T
+        USING `{staging_table_path}` S
+        ON T.id = S.id
+        WHEN MATCHED THEN
+          UPDATE SET T.data = S.data, T.ingestion_metadata = S.ingestion_metadata
+        WHEN NOT MATCHED THEN
+          INSERT (id, stripe_created, data, ingestion_metadata)
+          VALUES (id, stripe_created, data, ingestion_metadata)
+        """
+        bq_client.query(merge_query).result()
+
+        return f"Success: Synced {len(charges_list)} charges.", 200
 
     except Exception as e:
-        # This will now appear in your logs instead of crashing the container
-        print(f"RUNTIME ERROR: {str(e)}")
+        # This print statement will now show up in Logs Explorer
+        print(f"Error in execution: {str(e)}")
         return f"Error: {str(e)}", 500
