@@ -1,15 +1,13 @@
-- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+```yaml
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     args:
       - 'gcloud'
       - 'functions'
       - 'deploy'
       - 'stripe-fetch-charges'
       - '--gen2'
-      - '--runtime=python311'
-      - '--memory=512Mi'
+      - '--runtime=python311' # <--- CHANGE THIS
       - '--region=australia-southeast1'
-      - '--source=.'
       - '--entry-point=fetch_stripe_charges'
+      - '--memory=512Mi'
       - '--trigger-http'
-      - '--set-env-vars'
-      - 'GCP_PROJECT=$PROJECT_ID'
