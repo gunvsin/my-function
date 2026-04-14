@@ -1,4 +1,3 @@
-
 ```python
 import os
 import uuid
@@ -8,58 +7,85 @@ import stripe
 from google.cloud import secretmanager
 from google.cloud import bigquery
 
-# Retrieve Project ID from environment
+# Config
 PROJECT_ID = os.environ.get("GCP_PROJECT")
+SECRET_ID = "STRIPE_API_KEY"
+# We recommend a dedicated table for Charges for better query performance
+DATASET_ID = "stripe_dataset"
+TABLE_ID = "stripe_charges"
+STAGING_TABLE_ID = f"{TABLE_ID}_staging"
 
 def get_stripe_api_key():
     client = secretmanager.SecretManagerServiceClient()
-    # Ensure the secret name "STRIPE_API_KEY" matches what you created in Secret Manager
-    name = f"projects/{PROJECT_ID}/secrets/STRIPE_API_KEY/versions/latest"
+    name = f"projects/{PROJECT_ID}/secrets/{SECRET_ID}/versions/latest"
     response = client.access_secret_version(request={"name": name})
     return response.payload.data.decode("UTF-8")
 
 @functions_framework.http
 def fetch_stripe_charges(request):
-    """
-    HTTP Cloud Function entry point.
-    """
     try:
-        # Initialize clients
         stripe.api_key = get_stripe_api_key()
         bq_client = bigquery.Client()
 
-        # Calculate 24h window
+        # 1. Fetch data from Stripe
         now = datetime.datetime.now(datetime.UTC)
-        start_time = int((now - datetime.timedelta(hours=24)).timestamp())
-
-        charges_to_insert = []
+        twenty_four_hours_ago = int((now - datetime.timedelta(hours=24)).timestamp())
         
-        # Stripe auto-pagination
-        charges = stripe.Charge.list(created={"gte": start_time}, limit=100)
+        charges_list = []
+        charges = stripe.Charge.list(created={"gte": twenty_four_hours_ago}, limit=100)
 
         for charge in charges.auto_paging_iter():
-            row = charge.to_dict_recursive()
+            charge_dict = charge.to_dict_recursive()
             
-            # Add the required metadata field
-            # We use 'ingestion_metadata' to avoid overwriting Stripe's own 'metadata'
-            row['ingestion_metadata'] = {
-                'source_name': 'Stripe_Primary',
-                'utc_timestamp': datetime.datetime.now(datetime.UTC).isoformat(),
-                'uuid': str(uuid.uuid4())
+            # Prepare row for BigQuery
+            row = {
+                "id": charge_dict['id'], # Stripe Charge ID (e.g., ch_123)
+                "stripe_created": charge_dict['created'], # Unix timestamp
+                "data": charge_dict, # The full snapshot as JSON
+                "ingestion_metadata": {
+                    "source_name": "Stripe_Primary",
+                    "processing_timestamp": now.isoformat(),
+                    "batch_uuid": str(uuid.uuid4())
+                }
             }
-            charges_to_insert.append(row)
+            charges_list.append(row)
 
-        if charges_to_insert:
-            # Table ID format: project_id.dataset_id.table_id
-            table_id = f"{PROJECT_ID}.stripe_dataset.stripe_table" 
-            errors = bq_client.insert_rows_json(table_id, charges_to_insert)
-            
-            if errors:
-                return f"BigQuery Insert Errors: {errors}", 500
-            return f"Success: Inserted {len(charges_to_insert)} records.", 200
+        if not charges_list:
+            return "No charges found.", 200
+
+        # 2. Define Table Paths
+        full_table_path = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+        staging_table_path = f"{PROJECT_ID}.{DATASET_ID}.{STAGING_TABLE_ID}"
+
+        # 3. Load to Staging Table (Overwrite staging each time)
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE",
+        )
+        load_job = bq_client.load_table_from_json(charges_list, staging_table_path, job_config=job_config)
+        load_job.result() 
+
+        # 4. Perform MERGE Statement (Deduplication Logic)
+        # This updates the record if the ID exists, or inserts if it's new.
+        merge_query = f"""
+        MERGE `{full_table_path}` T
+        USING `{staging_table_path}` S
+        ON T.id = S.id
+        WHEN MATCHED THEN
+          UPDATE SET 
+            T.data = S.data, 
+            T.stripe_created = S.stripe_created,
+            T.ingestion_metadata = S.ingestion_metadata
+        WHEN NOT MATCHED THEN
+          INSERT (id, stripe_created, data, ingestion_metadata)
+          VALUES (id, stripe_created, data, ingestion_metadata)
+        """
         
-        return "No new charges found.", 200
+        query_job = bq_client.query(merge_query)
+        query_job.result()
+
+        return f"Successfully processed {len(charges_list)} charges with MERGE.", 200
 
     except Exception as e:
-        print(f"Error: {e}")
-        return str(e), 500
+        print(f"Error: {str(e)}")
+        return f"Error: {str(e)}", 500
+```
