@@ -1,13 +1,12 @@
-```yaml
-steps:
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     args:
       - 'gcloud'
       - 'functions'
       - 'deploy'
       - 'stripe-fetch-charges'
       - '--gen2'
-      - '--runtime=python311'  # <--- CRITICAL FIX
+      - '--runtime=python311'
+      - '--memory=512Mi'
       - '--region=australia-southeast1'
       - '--source=.'
       - '--entry-point=fetch_stripe_charges'
