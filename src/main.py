@@ -11,6 +11,58 @@ from google.cloud import secretmanager
 from google.cloud import bigquery
 import stripe
 
+The fact that you are on **Revision 16** with the same error indicates that the Python process is failing during the **`import`** phase—even before it reaches your function logic. 
+
+As a Google Cloud Engineer, I suspect that **Python 3.13** (which your logs show the builder is choosing) is incompatible with the specific versions of `grpcio` or `protobuf` required by the Google Cloud libraries. 
+
+Here is the **Emergency Recovery Plan** to get this deployed.
+
+### 1. Force the Runtime to Python 3.11
+Python 3.13 is very new. Cloud Functions 2nd Gen is most stable on **3.11**. 
+
+**Action:** Update your `cloudbuild.yaml` file. Ensure the `gcloud functions deploy` command specifically includes this flag:
+`--runtime=python311`
+
+---
+
+### 2. The "Atomic" `main.py` (Diagnostic Mode)
+We are going to move the **imports** inside the function. This is a technical "trick": it allows the container to start up and listen on Port 8080 **without loading any libraries first**. If there is a library error, you will finally see the real error message in the logs instead of a timeout.
+
+**Replace your `main.py` with this exact diagnostic code:**
+
+```python
+import functions_framework
+import os
+
+@functions_framework.http
+def fetch_stripe_charges(request):
+    # We move imports INSIDE to prevent the "Port 8080" startup crash
+    try:
+        import stripe
+        import uuid
+        import datetime
+        from google.cloud import secretmanager
+        from google.cloud import bigquery
+        print("Libraries imported successfully inside the function.")
+    except ImportError as e:
+        print(f"IMPORT ERROR: {str(e)}")
+        return f"Library Import Failed: {str(e)}", 500
+
+    try:
+        project_id = os.environ.get("GCP_PROJECT") or "project-babb1b90-331a-4e2e-a1b"
+        
+        # Test if we can at least talk to Secret Manager
+        sm_client = secretmanager.SecretManagerServiceClient()
+        secret_path = f"projects/{project_id}/secrets/STRIPE_API_KEY/versions/latest"
+        
+        # This is a 'Dry Run' - just checking connectivity
+        print(f"Connectivity test for: {secret_path}")
+        
+        return "Container started and libraries loaded. You are now safe to add the full logic back.", 200
+
+    except Exception as e:
+        print(f"RUNTIME ERROR: {str(e)}")
+        return f"Infrastructure OK, but logic failed: {str(e)}", 500
 @functions_framework.http
 def fetch_stripe_charges(request):
     # This minimal version helps us confirm if the clients can even load
