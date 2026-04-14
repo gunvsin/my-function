@@ -1,66 +1,67 @@
-```python
 import os
 import functions_framework
 
 @functions_framework.http
 def fetch_stripe_charges(request):
     """
-    Final Engineered Solution: Stripe to BigQuery.
-    Bypasses Port 8080 timeout by delaying all heavy library loads.
+    REVISION 32: Senior Developer Reset.
+    Zero-Global imports to ensure Port 8080 connectivity.
     """
-    print("Container Check-in: Listening on Port 8080. Logic starting...")
+    print("Container Startup Successful: Listening on Port 8080.")
 
     try:
-        # 1. Delayed Library Loading (Crucial for Cold Start success)
+        # 1. DELAYED IMPORTS
+        # We load these ONLY when the function is triggered.
         import uuid
         import datetime
         import stripe
         from google.cloud import secretmanager
         from google.cloud import bigquery
+        print("Libraries loaded successfully.")
+
+        # 2. CONFIGURATION
+        PROJECT_ID = "project-babb1b90-331a-4e2e-a1b"
+        DATASET_ID = "stripe_dataset"
+        TABLE_NAME = "stripe_charges"
         
-        # 2. Project Context
-        # Fallback to hardcoded ID to prevent env-var related startup crashes
-        project_id = os.environ.get("GCP_PROJECT") or "project-babb1b90-331a-4e2e-a1b"
-        
-        # 3. Client Initialization
+        # 3. CLIENT INITIALIZATION
         sm_client = secretmanager.SecretManagerServiceClient()
-        bq_client = bigquery.Client(project=project_id)
+        bq_client = bigquery.Client(project=PROJECT_ID)
 
-        # 4. API Key Access
-        secret_name = f"projects/{project_id}/secrets/STRIPE_API_KEY/versions/latest"
-        secret_version = sm_client.access_secret_version(request={"name": secret_name})
-        stripe.api_key = secret_version.payload.data.decode("UTF-8")
+        # 4. GET STRIPE KEY
+        secret_path = f"projects/{PROJECT_ID}/secrets/STRIPE_API_KEY/versions/latest"
+        secret_response = sm_client.access_secret_version(request={"name": secret_path})
+        stripe.api_key = secret_response.payload.data.decode("UTF-8")
 
-        # 5. Incremental Data Fetch
+        # 5. FETCH DATA (Last 24 Hours)
         now = datetime.datetime.now(datetime.UTC)
-        start_time = int((now - datetime.timedelta(hours=24)).timestamp())
+        start_ts = int((now - datetime.timedelta(hours=24)).timestamp())
         
-        charges_data = []
-        batch_id = str(uuid.uuid4())
+        charges_batch = []
+        batch_uuid = str(uuid.uuid4())
         
-        print(f"Fetching Stripe charges since Unix: {start_time}")
-        charges = stripe.Charge.list(created={"gte": start_time}, limit=100)
+        print(f"Syncing Stripe charges since: {start_ts}")
+        charges = stripe.Charge.list(created={"gte": start_ts}, limit=100)
 
         for charge in charges.auto_paging_iter():
             charge_dict = charge.to_dict_recursive()
-            charges_data.append({
+            charges_batch.append({
                 "id": charge_dict['id'],
                 "stripe_created": charge_dict['created'],
                 "data": charge_dict,
                 "ingestion_metadata": {
                     "source_name": "Stripe_Primary",
                     "processing_timestamp": now.isoformat(),
-                    "batch_uuid": batch_id
+                    "batch_uuid": batch_uuid
                 }
             })
 
-        if not charges_data:
-            return "Sync Success: No new records to process.", 200
+        if not charges_batch:
+            return "No new charges found in the last 24h.", 200
 
-        # 6. BigQuery Upsert (Staging-to-Master Merge)
-        dataset_id = "stripe_dataset"
-        master_table = f"{project_id}.{dataset_id}.stripe_charges"
-        staging_table = f"{project_id}.{dataset_id}.stripe_charges_staging"
+        # 6. BIGQUERY UPSERT (Merge Strategy)
+        master_table = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_NAME}"
+        staging_table = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_NAME}_staging"
 
         schema = [
             bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
@@ -73,12 +74,12 @@ def fetch_stripe_charges(request):
             ]),
         ]
 
-        # Load to staging table
+        # Load to staging
         job_config = bigquery.LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE")
-        bq_client.load_table_from_json(charges_data, staging_table, job_config=load_config).result()
+        bq_client.load_table_from_json(charges_batch, staging_table, job_config=load_config).result()
 
-        # Merge to master table (Handles snapshots/deduplication)
-        merge_query = f"""
+        # Merge staging to master
+        merge_sql = f"""
         MERGE `{master_table}` T
         USING `{staging_table}` S
         ON T.id = S.id
@@ -86,10 +87,11 @@ def fetch_stripe_charges(request):
         WHEN NOT MATCHED THEN INSERT (id, stripe_created, data, ingestion_metadata)
         VALUES (id, stripe_created, data, ingestion_metadata)
         """
-        bq_client.query(merge_query).result()
+        bq_client.query(merge_sql).result()
 
-        return f"Successfully synced {len(charges_data)} records.", 200
+        return f"Pipeline Success: {len(charges_batch)} charges synced.", 200
 
     except Exception as e:
-        print(f"PIPELINE FAILURE: {str(e)}")
+        # This will now appear in your Logs Explorer as a readable error
+        print(f"PIPELINE ERROR: {str(e)}")
         return f"Internal Error: {str(e)}", 500
