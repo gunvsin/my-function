@@ -6,95 +6,119 @@ import stripe
 from google.cloud import secretmanager
 from google.cloud import bigquery
 
-# We define the schema here so BigQuery knows the structure
-SCHEMA = [
+# We define the schema here as a static object. 
+# This is safe to keep global as it doesn't require API calls.
+TABLE_SCHEMA = [
     bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("stripe_created", "INTEGER", mode="NULLABLE"),
     bigquery.SchemaField("data", "JSON", mode="NULLABLE"),
     bigquery.SchemaField("ingestion_metadata", "RECORD", mode="NULLABLE", fields=[
-        bigquery.SchemaField("source_name", "STRING"),
-        bigquery.SchemaField("processing_timestamp", "TIMESTAMP"),
-        bigquery.SchemaField("batch_uuid", "STRING"),
+        bigquery.SchemaField("source_name", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("processing_timestamp", "TIMESTAMP", mode="NULLABLE"),
+        bigquery.SchemaField("batch_uuid", "STRING", mode="NULLABLE"),
     ]),
 ]
 
 @functions_framework.http
 def fetch_stripe_charges(request):
+    """
+    HTTP Cloud Function Entry Point.
+    Clients are initialized inside to prevent startup crashes.
+    """
+    # 1. Immediate confirmation log (visible in Logs Explorer)
+    print("Cloud Function: stripe-fetch-charges execution started.")
+    
     try:
-        # 1. Get Project ID from environment
-        project_id = os.environ.get("GCP_PROJECT") or "project-babb1b90-331a-4e2e-a1b"
-        
-        # 2. Initialize Clients INSIDE the function to prevent startup crashes
+        # 2. Get Project Context
+        # Using a fallback if environment variables are not set
+        project_id = os.environ.get("GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        if not project_id:
+            # Hardcoded fallback for your specific project if env vars fail
+            project_id = "project-babb1b90-331a-4e2e-a1b"
+
+        # 3. Initialize Clients (Inside the handler)
+        # This prevents the "Port 8080" timeout because initialization 
+        # happens AFTER the container is successfully listening.
         sm_client = secretmanager.SecretManagerServiceClient()
         bq_client = bigquery.Client(project=project_id)
 
-        # 3. Access Secret
+        # 4. Access Secret Manager for Stripe API Key
         secret_path = f"projects/{project_id}/secrets/STRIPE_API_KEY/versions/latest"
-        response = sm_client.access_secret_version(request={"name": secret_path})
-        stripe.api_key = response.payload.data.decode("UTF-8")
+        try:
+            secret_response = sm_client.access_secret_version(request={"name": secret_path})
+            stripe.api_key = secret_response.payload.data.decode("UTF-8")
+        except Exception as secret_error:
+            print(f"FAILED TO ACCESS SECRET: {str(secret_error)}")
+            return f"Error: Ensure Secret Manager Secret Accessor role is granted. {str(secret_error)}", 500
 
-        # 4. Fetch Stripe Data
+        # 5. Fetch Stripe Charges for the last 24 hours
         now = datetime.datetime.now(datetime.UTC)
-        start_time = int((now - datetime.timedelta(hours=24)).timestamp())
+        twenty_four_hours_ago = int((now - datetime.timedelta(hours=24)).timestamp())
         
-        charges_list = []
-        charges = stripe.Charge.list(created={"gte": start_time}, limit=100)
+        charges_data = []
+        batch_uuid = str(uuid.uuid4())
+        
+        print(f"Fetching charges from Stripe created >= {twenty_four_hours_ago}")
+        charges = stripe.Charge.list(created={"gte": twenty_four_hours_ago}, limit=100)
 
         for charge in charges.auto_paging_iter():
             charge_dict = charge.to_dict_recursive()
-            charges_list.append({
+            
+            charges_data.append({
                 "id": charge_dict['id'],
                 "stripe_created": charge_dict['created'],
-                "data": charge_dict,
+                "data": charge_dict, # BigQuery JSON type handles this
                 "ingestion_metadata": {
                     "source_name": "Stripe_Primary",
                     "processing_timestamp": now.isoformat(),
-                    "batch_uuid": str(uuid.uuid4())
+                    "batch_uuid": batch_uuid
                 }
             })
 
-        if not charges_list:
-            return "No new charges found.", 200
+        if not charges_data:
+            print("No charges found in the specified 24-hour window.")
+            return "No charges found.", 200
 
-        # 5. Table Configuration
+        # 6. BigQuery Sync (Staging to Master)
         dataset_id = "stripe_dataset"
-        table_id = "stripe_charges"
-        full_table_path = f"{project_id}.{dataset_id}.{table_id}"
-        staging_table_path = f"{project_id}.{dataset_id}.{table_id}_staging"
+        master_table = f"{project_id}.{dataset_id}.stripe_charges"
+        staging_table = f"{project_id}.{dataset_id}.stripe_charges_staging"
 
-        # 6. Load to Staging (This auto-creates the table if it doesn't exist)
-        job_config = bigquery.LoadJobConfig(
-            schema=SCHEMA,
+        # Load into Staging table (Overwrite each time)
+        load_config = bigquery.LoadJobConfig(
+            schema=TABLE_SCHEMA,
             write_disposition="WRITE_TRUNCATE",
         )
         
-        load_job = bq_client.load_table_from_json(charges_list, staging_table_path, job_config=job_config)
-        load_job.result()
+        print(f"Loading {len(charges_data)} records into staging: {staging_table}")
+        load_job = bq_client.load_table_from_json(charges_data, staging_table, job_config=load_config)
+        load_job.result() # Wait for load to complete
 
-        # 7. Ensure Master Table exists (Merge fails if Master is missing)
-        try:
-            bq_client.get_table(full_table_path)
-        except:
-            # Create master table with same schema if missing
-            table = bigquery.Table(full_table_path, schema=SCHEMA)
-            bq_client.create_table(table)
-
-        # 8. MERGE Logic
+        # 7. Perform Deduplicated MERGE
+        # If ID matches, update the record (Snapshot update); if new, insert it.
         merge_query = f"""
-        MERGE `{full_table_path}` T
-        USING `{staging_table_path}` S
+        MERGE `{master_table}` T
+        USING `{staging_table}` S
         ON T.id = S.id
         WHEN MATCHED THEN
-          UPDATE SET T.data = S.data, T.ingestion_metadata = S.ingestion_metadata
+          UPDATE SET 
+            T.data = S.data, 
+            T.ingestion_metadata = S.ingestion_metadata
         WHEN NOT MATCHED THEN
           INSERT (id, stripe_created, data, ingestion_metadata)
           VALUES (id, stripe_created, data, ingestion_metadata)
         """
-        bq_client.query(merge_query).result()
+        
+        print("Executing BigQuery MERGE for deduplication...")
+        query_job = bq_client.query(merge_query)
+        query_job.result()
 
-        return f"Success: Synced {len(charges_list)} charges.", 200
+        success_msg = f"Successfully synced {len(charges_data)} charges to BigQuery."
+        print(success_msg)
+        return success_msg, 200
 
     except Exception as e:
-        # This print statement will now show up in Logs Explorer
-        print(f"Error in execution: {str(e)}")
-        return f"Error: {str(e)}", 500
+        # Every error is caught here and logged to Cloud Logging (stderr)
+        error_msg = f"Execution Error: {str(e)}"
+        print(error_msg)
+        return error_msg, 500
