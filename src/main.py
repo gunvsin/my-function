@@ -1,62 +1,96 @@
-```python
 import os
-import json
+import uuid
+import datetime
+import functions_framework
 import stripe
-from google.cloud import bigquery
 from google.cloud import secretmanager
+from google.cloud import bigquery
 
-# Initialize Clients
+# Initialize clients OUTSIDE the function (Global Scope)
+# This allows the container to reuse connections across multiple calls
 sm_client = secretmanager.SecretManagerServiceClient()
 bq_client = bigquery.Client()
 
-def stripe_webhook_handler(request):
-    """Cloud Function to receive Stripe Webhook events."""
-    
-    # 1. Retrieve Secrets from Secret Manager
-    project_id = os.environ.get("GCP_PROJECT_ID")
-    
-    # We need TWO secrets now: your API Key and your Webhook Signing Secret
-    api_key_path = f"projects/{project_id}/secrets/STRIPE_API_KEY/versions/latest"
-    wh_secret_path = f"projects/{project_id}/secrets/STRIPE_WEBHOOK_SECRET/versions/latest"
-    
-    stripe.api_key = sm_client.access_secret_version(request={"name": api_key_path}).payload.data.decode("UTF-8")
-    endpoint_secret = sm_client.access_secret_version(request={"name": wh_secret_path}).payload.data.decode("UTF-8")
+@functions_framework.http
+def fetch_stripe_charges(request):
+    """
+    HTTP Cloud Function (2nd Gen / Cloud Run)
+    """
+    # 1. Configuration from Environment Variables
+    # (Set these in the Google Cloud Console)
+    PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
+    DATASET_ID = "stripe_dataset"
+    TABLE_ID = "stripe_charges"
+    SECRET_ID = "STRIPE_API_KEY"
 
-    # 2. Verify the Webhook Signature
-    payload = request.get_data(as_text=False)
-    sig_header = request.headers.get('Stripe-Signature')
+    if not PROJECT_ID:
+        return "Internal Error: GCP_PROJECT_ID environment variable not set.", 500
 
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
-    except ValueError as e:
-        return "Invalid payload", 400
-    except stripe.error.SignatureVerificationError as e:
-        return "Invalid signature", 400
+        # 2. Secret Retrieval
+        secret_path = f"projects/{PROJECT_ID}/secrets/{SECRET_ID}/versions/latest"
+        response = sm_client.access_secret_version(request={"name": secret_path})
+        stripe.api_key = response.payload.data.decode("UTF-8")
 
-    # 3. Handle the event type
-    # We only care about 'charge.succeeded' based on your previous requirements
-    if event['type'] == 'charge.succeeded':
-        charge = event['data']['object']
+        # 3. Time Window (Last 24 Hours)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        start_ts = int((now - datetime.timedelta(hours=24)).timestamp())
         
-        # Prepare data for BigQuery
-        rows_to_insert = [{
-            "id": charge['id'],
-            "stripe_created": charge['created'],
-            "data": charge,
-            "metadata": {
-                "source_name": "Stripe_Webhook",
-                "processing_timestamp": "auto", # BigQuery can handle current_timestamp
-                "batch_uuid": event['id']
-            }
-        }]
+        charges_data = []
+        batch_uuid = str(uuid.uuid4())
         
-        # Insert into BigQuery (Streaming Insert)
-        table_id = f"{project_id}.stripe_dataset.stripe_table"
-        errors = bq_client.insert_rows_json(table_id, rows_to_insert)
-        
-        if errors:
-            print(f"BigQuery Insert Errors: {errors}")
-            return "BigQuery Error", 500
+        # 4. Fetch Stripe Data
+        charges = stripe.Charge.list(created={"gte": start_ts}, limit=100)
+        for charge in charges.auto_paging_iter():
+            charge_dict = charge.to_dict_recursive()
+            charges_data.append({
+                "id": charge_dict['id'],
+                "stripe_created": charge_dict['created'],
+                "data": charge_dict,
+                "metadata": {
+                    "source_name": "Stripe_Primary",
+                    "processing_timestamp": now.isoformat(),
+                    "batch_uuid": batch_uuid
+                }
+            })
 
-    return "Success", 200
-```
+        if not charges_data:
+            return "Incremental Sync: 0 records found.", 200
+
+        # 5. BigQuery Operations
+        master_table = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+        staging_table = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}_staging"
+
+        schema = [
+            bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("stripe_created", "INTEGER"),
+            bigquery.SchemaField("data", "JSON"),
+            bigquery.SchemaField("metadata", "RECORD", fields=[
+                bigquery.SchemaField("source_name", "STRING"),
+                bigquery.SchemaField("processing_timestamp", "TIMESTAMP"),
+                bigquery.SchemaField("batch_uuid", "STRING"),
+            ]),
+        ]
+
+        # Load into Staging
+        job_config = bigquery.LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE")
+        load_job = bq_client.load_table_from_json(charges_data, staging_table, job_config=job_config)
+        load_job.result() # Wait for load to finish
+
+        # Merge to Master
+        merge_sql = f"""
+        MERGE `{master_table}` T
+        USING `{staging_table}` S
+        ON T.id = S.id
+        WHEN MATCHED THEN UPDATE SET T.data = S.data, T.metadata = S.metadata
+        WHEN NOT MATCHED THEN INSERT (id, stripe_created, data, metadata)
+        VALUES (S.id, S.stripe_created, S.data, S.metadata)
+        """
+        bq_client.query(merge_sql).result()
+
+        return f"Processed {len(charges_data)} records.", 200
+
+    except Exception as e:
+        # Logs to Cloud Logging
+        print(f"PIPELINE FAILURE: {str(e)}")
+        return f"Error: {str(e)}", 500
