@@ -1,105 +1,62 @@
 ```python
 import os
-import uuid
-import datetime
+import json
 import stripe
-from google.cloud import secretmanager
 from google.cloud import bigquery
+from google.cloud import secretmanager
 
-# 1st Gen functions use the 'request' parameter for HTTP triggers
-def fetch_stripe_charges(request):
-    """
-    GCP 1st Gen Cloud Function to fetch Stripe charges from the last 24h
-    and upsert them into BigQuery.
-    """
+# Initialize Clients
+sm_client = secretmanager.SecretManagerServiceClient()
+bq_client = bigquery.Client()
+
+def stripe_webhook_handler(request):
+    """Cloud Function to receive Stripe Webhook events."""
     
-    # --- CONFIGURATION ---
-    # It is better practice to use Environment Variables for these
-    PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "your-project-id")
-    DATASET_ID = "stripe_dataset"
-    TABLE_ID = "stripe_charges"
-    SECRET_ID = "STRIPE_API_KEY"
+    # 1. Retrieve Secrets from Secret Manager
+    project_id = os.environ.get("GCP_PROJECT_ID")
     
+    # We need TWO secrets now: your API Key and your Webhook Signing Secret
+    api_key_path = f"projects/{project_id}/secrets/STRIPE_API_KEY/versions/latest"
+    wh_secret_path = f"projects/{project_id}/secrets/STRIPE_WEBHOOK_SECRET/versions/latest"
+    
+    stripe.api_key = sm_client.access_secret_version(request={"name": api_key_path}).payload.data.decode("UTF-8")
+    endpoint_secret = sm_client.access_secret_version(request={"name": wh_secret_path}).payload.data.decode("UTF-8")
+
+    # 2. Verify the Webhook Signature
+    payload = request.get_data(as_text=False)
+    sig_header = request.headers.get('Stripe-Signature')
+
     try:
-        # 1. INITIALIZE CLIENTS
-        sm_client = secretmanager.SecretManagerServiceClient()
-        bq_client = bigquery.Client(project=PROJECT_ID)
+        event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
+    except ValueError as e:
+        return "Invalid payload", 400
+    except stripe.error.SignatureVerificationError as e:
+        return "Invalid signature", 400
 
-        # 2. SECRET RETRIEVAL
-        secret_path = f"projects/{PROJECT_ID}/secrets/{SECRET_ID}/versions/latest"
-        response = sm_client.access_secret_version(request={"name": secret_path})
-        stripe.api_key = response.payload.data.decode("UTF-8")
-
-        # 3. TIME WINDOW (Last 24 Hours)
-        now = datetime.datetime.now(datetime.timezone.utc)
-        start_ts = int((now - datetime.timedelta(hours=24)).timestamp())
+    # 3. Handle the event type
+    # We only care about 'charge.succeeded' based on your previous requirements
+    if event['type'] == 'charge.succeeded':
+        charge = event['data']['object']
         
-        charges_data = []
-        batch_uuid = str(uuid.uuid4())
+        # Prepare data for BigQuery
+        rows_to_insert = [{
+            "id": charge['id'],
+            "stripe_created": charge['created'],
+            "data": charge,
+            "metadata": {
+                "source_name": "Stripe_Webhook",
+                "processing_timestamp": "auto", # BigQuery can handle current_timestamp
+                "batch_uuid": event['id']
+            }
+        }]
         
-        # 4. FETCH DATA FROM STRIPE
-        # Using auto_paging_iter to handle more than 100 records automatically
-        charges = stripe.Charge.list(created={"gte": start_ts}, limit=100)
+        # Insert into BigQuery (Streaming Insert)
+        table_id = f"{project_id}.stripe_dataset.stripe_table"
+        errors = bq_client.insert_rows_json(table_id, rows_to_insert)
         
-        for charge in charges.auto_paging_iter():
-            charge_dict = charge.to_dict_recursive()
-            
-            # Construct the record with the requested metadata
-            charges_data.append({
-                "id": charge_dict['id'],
-                "stripe_created": charge_dict['created'],
-                "data": charge_dict, # The full JSON payload
-                "metadata": {
-                    "source_name": "Stripe_Primary",
-                    "processing_timestamp": now, # BigQuery client converts this to TIMESTAMP
-                    "batch_uuid": batch_uuid
-                }
-            })
+        if errors:
+            print(f"BigQuery Insert Errors: {errors}")
+            return "BigQuery Error", 500
 
-        if not charges_data:
-            return "No charges found in the last 24 hours.", 200
-
-        # 5. BIGQUERY INFRASTRUCTURE
-        master_table = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-        staging_table = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}_staging"
-
-        schema = [
-            bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("stripe_created", "INTEGER"),
-            bigquery.SchemaField("data", "JSON"),
-            bigquery.SchemaField("metadata", "RECORD", fields=[
-                bigquery.SchemaField("source_name", "STRING"),
-                bigquery.SchemaField("processing_timestamp", "TIMESTAMP"),
-                bigquery.SchemaField("batch_uuid", "STRING"),
-            ]),
-        ]
-
-        # 6. LOAD TO STAGING & MERGE (Upsert)
-        # WRITE_TRUNCATE ensures the staging table is clean for this batch
-        job_config = bigquery.LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE")
-        
-        # Load batch into staging
-        load_job = bq_client.load_table_from_json(charges_data, staging_table, job_config=job_config)
-        load_job.result() 
-
-        # Merge SQL to prevent duplicate records if the function runs multiple times
-        merge_sql = f"""
-        MERGE `{master_table}` T
-        USING `{staging_table}` S
-        ON T.id = S.id
-        WHEN MATCHED THEN 
-            UPDATE SET T.data = S.data, T.metadata = S.metadata
-        WHEN NOT MATCHED THEN 
-            INSERT (id, stripe_created, data, metadata)
-            VALUES (S.id, S.stripe_created, S.data, S.metadata)
-        """
-        
-        query_job = bq_client.query(merge_sql)
-        query_job.result()
-
-        return f"Successfully processed {len(charges_data)} records.", 200
-
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return f"Internal Server Error: {str(e)}", 500
+    return "Success", 200
 ```
