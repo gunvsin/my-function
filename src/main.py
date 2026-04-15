@@ -6,40 +6,35 @@ import stripe
 from google.cloud import secretmanager
 from google.cloud import bigquery
 
-# Initialize clients OUTSIDE the function (Global Scope)
-# This allows the container to reuse connections across multiple calls
+# Initialize clients globally for better performance
 sm_client = secretmanager.SecretManagerServiceClient()
 bq_client = bigquery.Client()
 
 @functions_framework.http
 def fetch_stripe_charges(request):
-    """
-    HTTP Cloud Function (2nd Gen / Cloud Run)
-    """
-    # 1. Configuration from Environment Variables
-    # (Set these in the Google Cloud Console)
+    # Configuration from Environment Variables
     PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
     DATASET_ID = "stripe_dataset"
     TABLE_ID = "stripe_charges"
     SECRET_ID = "STRIPE_API_KEY"
 
     if not PROJECT_ID:
-        return "Internal Error: GCP_PROJECT_ID environment variable not set.", 500
+        return "Internal Error: GCP_PROJECT_ID not set.", 500
 
     try:
-        # 2. Secret Retrieval
+        # 1. Get Secret
         secret_path = f"projects/{PROJECT_ID}/secrets/{SECRET_ID}/versions/latest"
         response = sm_client.access_secret_version(request={"name": secret_path})
         stripe.api_key = response.payload.data.decode("UTF-8")
 
-        # 3. Time Window (Last 24 Hours)
+        # 2. Setup Timeframe
         now = datetime.datetime.now(datetime.timezone.utc)
         start_ts = int((now - datetime.timedelta(hours=24)).timestamp())
         
         charges_data = []
         batch_uuid = str(uuid.uuid4())
         
-        # 4. Fetch Stripe Data
+        # 3. Fetch Data
         charges = stripe.Charge.list(created={"gte": start_ts}, limit=100)
         for charge in charges.auto_paging_iter():
             charge_dict = charge.to_dict_recursive()
@@ -55,9 +50,9 @@ def fetch_stripe_charges(request):
             })
 
         if not charges_data:
-            return "Incremental Sync: 0 records found.", 200
+            return "0 records found.", 200
 
-        # 5. BigQuery Operations
+        # 4. BigQuery Merge
         master_table = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
         staging_table = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}_staging"
 
@@ -72,12 +67,9 @@ def fetch_stripe_charges(request):
             ]),
         ]
 
-        # Load into Staging
         job_config = bigquery.LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE")
-        load_job = bq_client.load_table_from_json(charges_data, staging_table, job_config=job_config)
-        load_job.result() # Wait for load to finish
+        bq_client.load_table_from_json(charges_data, staging_table, job_config=job_config).result()
 
-        # Merge to Master
         merge_sql = f"""
         MERGE `{master_table}` T
         USING `{staging_table}` S
@@ -88,9 +80,8 @@ def fetch_stripe_charges(request):
         """
         bq_client.query(merge_sql).result()
 
-        return f"Processed {len(charges_data)} records.", 200
+        return f"Successfully processed {len(charges_data)} records.", 200
 
     except Exception as e:
-        # Logs to Cloud Logging
         print(f"PIPELINE FAILURE: {str(e)}")
         return f"Error: {str(e)}", 500
