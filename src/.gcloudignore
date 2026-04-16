@@ -1,0 +1,9 @@
+.gcloudignore
+.git
+.gitignore
+.codeoss/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.codeoss/

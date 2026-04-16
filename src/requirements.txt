@@ -1,8 +1,4 @@
-``text
-functions-framework==3.*
-stripe==7.*
-google-cloud-secret-manager==2.*
-google-cloud-bigquery==3.*
-```
-
----
+functions-framework==3.5.0
+stripe==7.14.0
+google-cloud-secret-manager==2.17.0
+google-cloud-bigquery==3.12.0
