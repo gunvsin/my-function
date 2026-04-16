@@ -6,45 +6,60 @@ import functions_framework
 from google.cloud import bigquery
 from google.cloud import secretmanager
 
-# --- GLOBAL INITIALIZATION (Reused across function invocations) ---
-# This reduces latency and prevents "Cold Start" overhead
+# --- GLOBAL INITIALIZATION ---
+# Initializing clients outside the handler allows for "Warm Start" reuse,
+# significantly reducing latency and execution cost.
 sm_client = secretmanager.SecretManagerServiceClient()
 bq_client = bigquery.Client()
 
-# Global variables to cache secrets in memory
-STRIPE_KEYS = {"api_key": None, "webhook_secret": None}
+# Local cache for secrets to prevent redundant API calls to Secret Manager
+runtime_cache = {
+    "stripe_api_key": None,
+    "webhook_secret": None
+}
 
-def get_secrets(project_id):
-    """Retrieves secrets once per container lifecycle to optimize performance."""
-    if not STRIPE_KEYS["api_key"] or not STRIPE_KEYS["webhook_secret"]:
-        print("Fetching secrets from Secret Manager...")
+def load_secrets(project_id):
+    """Retrieves and caches secrets from Secret Manager."""
+    if not runtime_cache["stripe_api_key"] or not runtime_cache["webhook_secret"]:
+        print("Initial lookup: Fetching secrets from Secret Manager...")
         
-        # 1. Fetch Stripe API Key
-        name_api = f"projects/{project_id}/secrets/STRIPE_API_KEY/versions/latest"
-        res_api = sm_client.access_secret_version(request={"name": name_api})
-        STRIPE_KEYS["api_key"] = res_api.payload.data.decode("UTF-8")
+        # Access Stripe API Key
+        api_key_name = f"projects/{project_id}/secrets/STRIPE_API_KEY/versions/latest"
+        api_response = sm_client.access_secret_version(request={"name": api_key_name})
+        runtime_cache["stripe_api_key"] = api_response.payload.data.decode("UTF-8")
         
-        # 2. Fetch Webhook Signing Secret
-        name_wh = f"projects/{project_id}/secrets/STRIPE_WEBHOOK_SECRET/versions/latest"
-        res_wh = sm_client.access_secret_version(request={"name": name_wh})
-        STRIPE_KEYS["webhook_secret"] = res_wh.payload.data.decode("UTF-8")
+        # Access Webhook Signing Secret
+        wh_secret_name = f"projects/{project_id}/secrets/STRIPE_WEBHOOK_SECRET/versions/latest"
+        wh_response = sm_client.access_secret_version(request={"name": wh_secret_name})
+        runtime_cache["webhook_secret"] = wh_response.payload.data.decode("UTF-8")
         
-    return STRIPE_KEYS["api_key"], STRIPE_KEYS["webhook_secret"]
+    return runtime_cache["stripe_api_key"], runtime_cache["webhook_secret"]
 
 @functions_framework.http
 def stripe_webhook_handler(request):
     """
-    Master Event Handler: Receives any Stripe Event and streams it to BigQuery.
+    Expert-level Webhook Handler for Stripe Master Events.
+    Captures all event types into a single partitioned BigQuery table.
     """
+    # 1. Environment Configuration
     project_id = os.environ.get("GCP_PROJECT_ID")
     dataset_id = "stripe_dataset"
-    table_id = "stripe_events"  # The Master Table
+    table_id = "stripe_events"
     
-    # 1. Initialize Stripe
-    api_key, webhook_secret = get_secrets(project_id)
-    stripe.api_key = api_key
+    if not project_id:
+        print("CRITICAL: GCP_PROJECT_ID environment variable is missing.")
+        return "Internal Configuration Error", 500
 
-    # 2. Verify Webhook Signature
+    # 2. Secret Retrieval
+    try:
+        api_key, webhook_secret = load_secrets(project_id)
+        stripe.api_key = api_key
+    except Exception as e:
+        print(f"Secret Manager Error: {str(e)}")
+        return "Internal Security Error", 500
+
+    # 3. Webhook Signature Verification
+    # This ensures the request is legitimately from Stripe
     payload = request.get_data()
     sig_header = request.headers.get("Stripe-Signature")
 
@@ -53,42 +68,42 @@ def stripe_webhook_handler(request):
             payload, sig_header, webhook_secret
         )
     except ValueError as e:
-        print(f"Invalid payload: {e}")
-        return "Invalid payload", 400
+        # Invalid payload
+        return "Invalid Payload", 400
     except stripe.error.SignatureVerificationError as e:
-        print(f"Invalid signature: {e}")
-        return "Invalid signature", 400
+        # Invalid signature
+        print(f"Signature Verification Failed: {str(e)}")
+        return "Invalid Signature", 400
 
-    # 3. Extract Core Data
-    # Note: 'event' is the wrapper. 'event.data.object' is the actual Charge, Customer, etc.
+    # 4. Data Extraction
     event_type = event['type']
     stripe_object = event['data']['object']
     
-    # 4. Construct Data Engineering Payload
-    # Using the high-precision UTC timestamp and source metadata requested
+    # 5. Construct BigQuery Row
+    # Note: processing_timestamp is TOP-LEVEL to allow BigQuery Partitioning.
     row_to_insert = {
-        "id": event['id'],               # Unique Event ID from Stripe
-        "object_id": stripe_object.get('id'), # The ID of the charge/customer
+        "id": event['id'],               # Unique ID for the Stripe Event
+        "object_id": stripe_object.get('id'), # ID of the actual Charge/Customer/etc.
         "event_type": event_type,
         "stripe_created": event['created'],
-        "data": stripe_object,           # Full JSON object
+        "data": stripe_object,           # Full JSON object for downstream parsing
+        "processing_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "metadata": {
             "source_name": "Stripe_Webhook_Master",
-            "processing_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "batch_uuid": event.get('request', {}).get('id', 'manual_or_system')
+            "batch_uuid": event.get('request', {}).get('id', 'N/A') # Stripe Request ID
         }
     }
 
-    # 5. Streaming Insert to BigQuery
-    # Webhooks must respond fast (<10s). bq_client.insert_rows_json is the fastest method.
-    full_table_path = f"{project_id}.{dataset_id}.{table_id}"
+    # 6. Streaming Insert to BigQuery
+    # Using insert_rows_json for near real-time ingestion
+    table_full_path = f"{project_id}.{dataset_id}.{table_id}"
     
-    errors = bq_client.insert_rows_json(full_table_path, [row_to_insert])
+    errors = bq_client.insert_rows_json(table_full_path, [row_to_insert])
 
     if errors:
-        print(f"BigQuery Streaming Error: {errors}")
-        # We return 500 so Stripe knows to retry the webhook later
-        return f"BigQuery Error: {errors}", 500
+        # Returning a non-200 code triggers Stripe's automatic retry logic
+        print(f"BigQuery Insert Error for event {event['id']}: {errors}")
+        return f"Data Ingestion Error: {errors}", 500
 
-    print(f"Successfully ingested event {event['id']} ({event_type})")
-    return "Event Received", 200
+    print(f"Successfully ingested {event_type} event: {event['id']}")
+    return "OK", 200
