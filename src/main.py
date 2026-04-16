@@ -29,7 +29,8 @@ def fetch_stripe_charges(request):
 
         # 2. Setup Timeframe
         now = datetime.datetime.now(datetime.timezone.utc)
-        start_ts = int((now - datetime.timedelta(hours=24)).timestamp())
+        #start_ts = int((now - datetime.timedelta(hours=24)).timestamp())
+        start_ts = int((now - datetime.timedelta(days=30)).timestamp()) 
         
         charges_data = []
         batch_uuid = str(uuid.uuid4())
